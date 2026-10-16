@@ -16,9 +16,12 @@
   table td, table th { padding:0.55rem 0.75rem; white-space:nowrap; }
   tbody tr { border-top:1px solid #1e2a44; }
   .status-ok { color:#34d399; } .status-watch { color:#fbbf24; }
+  .sev-ok { background:#064e3b; color:#a7f3d0; }
+  .live-dot { width:0.6rem; height:0.6rem; border-radius:9999px; background:#ef4444; display:inline-block; animation:livePulse 1.2s ease-in-out infinite; }
+  @keyframes livePulse { 0%,100% { opacity:1; transform:scale(1); } 50% { opacity:0.35; transform:scale(0.75); } }
 </style>
 </head>
-<body class="text-slate-200 min-h-screen font-sans">
+<body id="dashRoot" class="text-slate-200 min-h-screen font-sans">
 
 <!-- Header -->
 <header class="border-b border-slate-800 bg-[#0d1626]">
@@ -32,6 +35,14 @@
       <a class="px-3 py-2 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-200" href="https://github.com/Narasimha3008" target="_blank" rel="noopener">GitHub</a>
       <a class="px-3 py-2 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-200" href="https://narasimha3008.github.io" target="_blank" rel="noopener">Portfolio</a>
     </nav>
+    <div class="flex flex-col items-end gap-2">
+      <div class="flex items-center gap-2">
+        <span id="liveBadge" class="hidden items-center gap-2 px-3 py-2 rounded-lg bg-red-950 border border-red-800 text-red-300 text-sm font-semibold tracking-widest"><span class="live-dot"></span>LIVE<span id="liveClock" class="font-mono font-normal text-red-200">--:--:--</span></span>
+        <button id="liveBtn" class="px-3 py-2 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-200 text-sm">Go Live</button>
+        <button id="fsBtn" class="px-3 py-2 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-200 text-sm">Fullscreen</button>
+      </div>
+      <p id="liveStatus" class="hidden text-xs text-slate-400 font-mono"></p>
+    </div>
   </div>
 </header>
 
@@ -97,7 +108,7 @@
   </section>
 
   <footer class="text-center text-slate-500 text-xs py-4">
-    Demo data — all figures are simulated in the browser for demonstration purposes only. Not connected to any live payment system.
+    Demo data — all figures are simulated in the browser for demonstration purposes only. Not connected to any live payment system. Live mode simulates a real-time stream.
   </footer>
 </main>
 
@@ -250,12 +261,215 @@ function renderAlerts(agg, partners){
     '<li class="flex gap-3"><span class="shrink-0 h-fit px-2 py-0.5 rounded text-[0.65rem] font-bold uppercase '+a.cls+'">'+a.label+'</span><div><p class="text-slate-200">'+a.text+'</p><p class="text-slate-500 text-xs mt-0.5">'+a.time+'</p></div></li>').join('');
 }
 
+// ---------- Live Mode (simulated real-time stream) ----------
+const LIVE = {
+  on:false, rand:null,
+  tickTimer:null, alertTimer:null, clockTimer:null,
+  agg:null, prevAgg:null, perChannel:{}, gateways:[], series:[],
+  channelFilter:'all', lastTickAt:0, alertIdx:0, alertCount:0
+};
+let displayed = { vol:0, tx:0, success:0, avgTicket:0, refund:0 }; // raw values currently on the KPI cards
+let lastRender = null;                                            // snapshot of the most recent static render
+const activeTweens = {};
+
+function clockString(){ return new Date().toLocaleTimeString('en-GB'); } // HH:MM:SS
+
+// Animated count transition for a KPI value element
+function tweenText(key, el, from, to, fmt){
+  if(activeTweens[key]) cancelAnimationFrame(activeTweens[key]);
+  const start = performance.now(), dur = 700;
+  function step(now){
+    const p = Math.min(1, (now-start)/dur), e = 1 - Math.pow(1-p, 3);
+    el.textContent = fmt(from + (to-from)*e);
+    if(p<1) activeTweens[key] = requestAnimationFrame(step); else delete activeTweens[key];
+  }
+  activeTweens[key] = requestAnimationFrame(step);
+}
+
+// One simulated minute of activity — same shape and scale as the daily generator, divided across 1440 minutes
+function genMinute(){
+  const rand = LIVE.rand;
+  const dow = new Date().getDay();
+  const weekendDip = (dow===0||dow===6) ? 0.82 : 1.0;
+  const per = {};
+  CHANNELS.forEach(c=>{
+    const txns = Math.max(0, Math.round(42000 * c.share * weekendDip / 1440 * (0.75 + rand()*0.5)));
+    const volume = Math.round(txns * c.avgTicket * (0.92 + rand()*0.16));
+    per[c.name] = { txns, volume,
+      successRate: Math.min(0.999, Math.max(0.85, c.success + (rand()-0.5)*0.01)),
+      refundRate: 0.006 + rand()*0.006 };
+  });
+  return per;
+}
+
+// (Re)seed all live accumulators from the latest static render, so live updates
+// always continue from — and stay inside — the currently selected filter view.
+function seedLive(){
+  if(!lastRender) return;
+  const a = lastRender.curAgg;
+  LIVE.agg = { vol:a.vol, tx:a.tx, succW:a.success*a.tx, refundW:a.refund*a.tx };
+  LIVE.prevAgg = lastRender.prevAgg;
+  LIVE.channelFilter = lastRender.channelFilter;
+  LIVE.perChannel = {};
+  CHANNELS.forEach(c=>{ const pc = a.perChannel[c.name]; LIVE.perChannel[c.name] = pc ? { vol:pc.vol, tx:pc.tx } : { vol:0, tx:0 }; });
+  const gwTotal = lastRender.gateways.reduce((s,g)=>s+g.volume,0) || 1;
+  LIVE.gateways = lastRender.gateways.map(g=>({ name:g.name, volume:g.volume, w:g.volume/gwTotal }));
+  LIVE.series = lastRender.series.map(s=>({ label:s.label, v:s.v }));
+}
+
+function updateLiveKpis(){
+  const a = LIVE.agg, p = LIVE.prevAgg;
+  const success = a.tx ? a.succW/a.tx : 0;
+  const refund  = a.tx ? a.refundW/a.tx : 0;
+  const avg     = a.tx ? a.vol/a.tx : 0;
+  const targets = [
+    { key:'vol',       to:a.vol,   fmt:fmtUSD },
+    { key:'tx',        to:a.tx,    fmt:v=>Math.round(v).toLocaleString('en-US') },
+    { key:'success',   to:success, fmt:fmtPct },
+    { key:'avgTicket', to:avg,     fmt:fmtUSD },
+    { key:'refund',    to:refund,  fmt:fmtPct }
+  ];
+  targets.forEach((t,i)=>{
+    const el = document.getElementById('kpiVal-'+i);
+    if(el) tweenText('kpi'+i, el, displayed[t.key], t.to, t.fmt);
+    displayed[t.key] = t.to;
+  });
+  const deltas = [
+    deltaHTML(a.vol, p.vol, false), deltaHTML(a.tx, p.tx, false),
+    deltaHTML(success, p.success, false), deltaHTML(avg, p.avgTicket, false),
+    deltaHTML(refund, p.refund, true)
+  ];
+  deltas.forEach((d,i)=>{ const el = document.getElementById('kpiDelta-'+i); if(el) el.innerHTML = d; });
+}
+
+function liveTick(){
+  if(!LIVE.on || !LIVE.agg) return;
+  const minute = genMinute();
+  let mVol=0, mTx=0, mSuccW=0, mRefundW=0;
+  CHANNELS.forEach(c=>{
+    const m = minute[c.name];
+    LIVE.perChannel[c.name].vol += m.volume;
+    LIVE.perChannel[c.name].tx  += m.txns;
+    if(LIVE.channelFilter!=='all' && c.name!==LIVE.channelFilter) return; // accumulate KPIs only inside the filter context
+    mVol += m.volume; mTx += m.txns; mSuccW += m.successRate*m.txns; mRefundW += m.refundRate*m.txns;
+  });
+  LIVE.agg.vol += mVol; LIVE.agg.tx += mTx; LIVE.agg.succW += mSuccW; LIVE.agg.refundW += mRefundW;
+  const jit = LIVE.gateways.map(g=> g.w * (0.9 + LIVE.rand()*0.2));
+  const jSum = jit.reduce((s,x)=>s+x,0) || 1;
+  LIVE.gateways.forEach((g,i)=>{ g.volume += Math.round(mVol * jit[i]/jSum); });
+
+  updateLiveKpis();
+
+  if(trendChart && LIVE.series.length){
+    const runRate = mVol * 1440; // this minute expressed as a daily rate — same scale as the daily series
+    const prevV = LIVE.series[LIVE.series.length-1].v;
+    LIVE.series.push({ label: clockString(), v: Math.round(prevV*0.55 + runRate*0.45) });
+    LIVE.series.shift();
+    trendChart.data.labels = LIVE.series.map(s=>s.label);
+    trendChart.data.datasets[0].data = LIVE.series.map(s=>s.v);
+    trendChart.update(); // default Chart.js animation gives the slide
+  }
+  if(mixChart){
+    mixChart.data.datasets[0].data = mixChart.data.labels.map(n=> LIVE.perChannel[n] ? Math.round(LIVE.perChannel[n].vol) : 0);
+    mixChart.update();
+  }
+  if(gwChart){
+    gwChart.data.datasets[0].data = LIVE.gateways.map(g=>g.volume);
+    gwChart.update();
+  }
+  LIVE.lastTickAt = Date.now();
+  updateLiveStatus();
+}
+
+const LIVE_ALERT_POOL = [
+  { cls:'sev-crit', label:'Critical', text:'Authorization rate on Gateway B is slipping — issuer declines rising over the last few minutes.' },
+  { cls:'sev-warn', label:'Warning',  text:'E-commerce 3-D Secure challenge failures are above baseline in the live stream.' },
+  { cls:'sev-info', label:'Info',     text:'ACH settlement window opened — the next batch has been queued for processing.' },
+  { cls:'sev-warn', label:'Warning',  text:'Average Wallet ticket is climbing — possible mix shift toward larger baskets.' },
+  { cls:'sev-info', label:'Info',     text:'Reconciliation checkpoint passed: no unmatched transactions in the latest live file.' },
+  { cls:'sev-crit', label:'Critical', text:'Gateway C authorization latency is above 2s — retry volume increasing.' },
+  { cls:'sev-warn', label:'Warning',  text:'Refund submissions from one partner are spiking — review queue is growing.' },
+  { cls:'sev-info', label:'Info',     text:'Card Present volume is pacing ahead of the same time yesterday.' }
+];
+function liveAlert(){
+  if(!LIVE.on) return;
+  const a = LIVE_ALERT_POOL[LIVE.alertIdx % LIVE_ALERT_POOL.length]; LIVE.alertIdx++;
+  const list = document.getElementById('alertsList');
+  const li = document.createElement('li');
+  li.className = 'flex gap-3';
+  li.innerHTML = '<span class="shrink-0 h-fit px-2 py-0.5 rounded text-[0.65rem] font-bold uppercase '+a.cls+'">'+a.label+'</span><div><p class="text-slate-200">'+a.text+'</p><p class="text-slate-500 text-xs mt-0.5">'+clockString()+'</p></div>';
+  list.prepend(li);
+  LIVE.alertCount++;
+  if(LIVE.alertCount % 3 === 0){ // every third new alert, retire the oldest open one as Resolved
+    const items = list.querySelectorAll('li');
+    for(let i=items.length-1;i>0;i--){
+      const badge = items[i].querySelector('span');
+      if(badge && !badge.dataset.resolved){
+        badge.dataset.resolved = '1';
+        badge.className = badge.className.replace(/sev-(crit|warn|info)/, 'sev-ok');
+        badge.textContent = 'Resolved';
+        break;
+      }
+    }
+  }
+  while(list.children.length > 8) list.removeChild(list.lastElementChild); // cap the feed
+}
+
+function updateClock(){ const el = document.getElementById('liveClock'); if(el) el.textContent = clockString(); }
+function updateLiveStatus(){
+  const el = document.getElementById('liveStatus');
+  if(!el || !LIVE.on) return;
+  const s = LIVE.lastTickAt ? Math.max(0, Math.round((Date.now()-LIVE.lastTickAt)/1000)) : 0;
+  el.textContent = 'Streaming · last updated ' + s + 's ago';
+}
+
+function startLive(){
+  LIVE.on = true;
+  LIVE.rand = mulberry32((Date.now() % 2147483647) >>> 0 || 12345); // live generator, seeded at start
+  LIVE.alertIdx = 0; LIVE.alertCount = 0;
+  seedLive();
+  const badge = document.getElementById('liveBadge');
+  badge.classList.remove('hidden'); badge.classList.add('inline-flex');
+  document.getElementById('liveStatus').classList.remove('hidden');
+  const btn = document.getElementById('liveBtn');
+  btn.textContent = 'Stop Live';
+  btn.classList.remove('bg-slate-800','hover:bg-slate-700');
+  btn.classList.add('bg-red-900','hover:bg-red-800','text-red-100');
+  LIVE.lastTickAt = Date.now();
+  updateClock(); updateLiveStatus();
+  LIVE.clockTimer = setInterval(()=>{ updateClock(); updateLiveStatus(); }, 1000);
+  LIVE.tickTimer = setInterval(liveTick, 3000);
+  LIVE.alertTimer = setInterval(liveAlert, 25000);
+}
+
+function stopLive(){
+  LIVE.on = false;
+  ['tickTimer','alertTimer','clockTimer'].forEach(k=>{ if(LIVE[k]){ clearInterval(LIVE[k]); LIVE[k]=null; } });
+  Object.keys(activeTweens).forEach(k=>{ cancelAnimationFrame(activeTweens[k]); delete activeTweens[k]; });
+  const badge = document.getElementById('liveBadge');
+  badge.classList.add('hidden'); badge.classList.remove('inline-flex');
+  document.getElementById('liveStatus').classList.add('hidden');
+  const btn = document.getElementById('liveBtn');
+  btn.textContent = 'Go Live';
+  btn.classList.add('bg-slate-800','hover:bg-slate-700');
+  btn.classList.remove('bg-red-900','hover:bg-red-800','text-red-100');
+  render(); // restore the static view, recomputed from the base dataset
+}
+
+document.getElementById('liveBtn').addEventListener('click', ()=>{ LIVE.on ? stopLive() : startLive(); });
+document.getElementById('fsBtn').addEventListener('click', ()=>{
+  if(document.fullscreenElement){ document.exitFullscreen(); }
+  else { const root = document.getElementById('dashRoot'); if(root && root.requestFullscreen) root.requestFullscreen(); }
+});
+
 // ---------- Render ----------
 function render(){
   const rangeDays = parseInt(document.getElementById('rangeSel').value,10);
   const channelFilter = document.getElementById('channelSel').value;
   const { curAgg, prevAgg, series } = aggregate(rangeDays, channelFilter);
   const { gateways, partners } = splits(rangeDays, channelFilter, curAgg);
+  lastRender = { rangeDays, channelFilter, curAgg, prevAgg, series, gateways };
+  displayed = { vol:curAgg.vol, tx:curAgg.tx, success:curAgg.success, avgTicket:curAgg.avgTicket, refund:curAgg.refund };
 
   const kpis = [
     { label:'Total Volume', value: fmtUSD(curAgg.vol), delta: deltaHTML(curAgg.vol, prevAgg.vol,false) },
@@ -264,14 +478,16 @@ function render(){
     { label:'Average Ticket', value: fmtUSD(curAgg.avgTicket), delta: deltaHTML(curAgg.avgTicket, prevAgg.avgTicket,false) },
     { label:'Refund / Chargeback Rate', value: fmtPct(curAgg.refund), delta: deltaHTML(curAgg.refund, prevAgg.refund,true) }
   ];
-  document.getElementById('kpiRow').innerHTML = kpis.map(k =>
-    '<div class="card p-4"><p class="text-xs uppercase tracking-wide text-slate-400">'+k.label+'</p><p class="text-2xl font-bold text-white mt-2">'+k.value+'</p><p class="text-xs mt-2">'+k.delta+'</p></div>').join('');
+  document.getElementById('kpiRow').innerHTML = kpis.map((k,i) =>
+    '<div class="card p-4"><p class="text-xs uppercase tracking-wide text-slate-400">'+k.label+'</p><p class="text-2xl font-bold text-white mt-2" id="kpiVal-'+i+'">'+k.value+'</p><p class="text-xs mt-2" id="kpiDelta-'+i+'">'+k.delta+'</p></div>').join('');
 
   renderCharts(series, curAgg.perChannel, gateways, channelFilter);
   renderAlerts(curAgg, partners);
 
   document.getElementById('partnerBody').innerHTML = partners.map(p =>
     '<tr><td class="text-slate-100">'+p.name+'</td><td class="text-right">'+fmtUSD(p.volume)+'</td><td class="text-right">'+p.txns.toLocaleString('en-US')+'</td><td class="text-right">'+fmtPct(p.success)+'</td><td class="'+(p.status==='Healthy'?'status-ok':'status-watch')+'">'+p.status+'</td></tr>').join('');
+
+  if(LIVE.on) seedLive(); // filter changed mid-stream: re-seed live state from the fresh view
 }
 
 document.getElementById('rangeSel').addEventListener('change', render);
